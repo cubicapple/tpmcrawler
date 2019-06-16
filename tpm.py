@@ -142,14 +142,16 @@ class PDF:
 
 	def read_pages(self, pdf):
 		i = 1
-		for page in self.magazine.json['pages']:
-			content_type, f = self.load_image(page['page'][0]['url'])
+		for page_json in self.magazine.json['pages']:
+			page_json = page_json['page'][0]
+			content_type, f = self.load_image(page_json['url'])
 			img = fitz.open( stream = f, filetype = content_type)
 			rect = img[0].rect
 			pdf_bytes = img.convertToPDF()
 			img.close()
-			page = pdf.newPage( width = rect.width, height = rect.height)
-			page.showPDFpage( rect, fitz.open( 'pdf', pdf_bytes), 0)
+			page_pdf = pdf.newPage( width = rect.width, height = rect.height)
+			page_pdf.showPDFpage( rect, fitz.open( 'pdf', pdf_bytes), 0)
+			self.create_page_links( page_pdf, page_json)
 
 			sys.stdout.write('.')
 			sys.stdout.flush()
@@ -160,14 +162,62 @@ class PDF:
 
 		print()
 
+	def translate_rect( self, inner, outer):
+		w, h = outer[2]-outer[0], outer[3]-outer[1]
+		return (
+			outer[0] + inner[0]*w,
+			outer[1] + inner[1]*h,
+			outer[0] + inner[2]*w,
+			outer[1] + inner[3]*h)
+
+	def append_pdf_link( self, page_pdf, url, rect, border):
+		link_dict = {
+			'kind': fitz.LINK_URI,
+			'uri': url,
+			'from': rect}
+		page_pdf.insertLink( link_dict)
+		link = page_pdf.firstLink
+		while (link.next):
+			link = link.next
+		link.setBorder( border)
+		return link
+
+	def append_media_annot( self, page_pdf, url, rect):
+		filename = re.sub( r'\.mpeg$', '.mp3', os.path.basename( url))
+		with URLReader().read(url).stream as f:
+			page_pdf.addFileAnnot( rect.tl, f, filename=filename)
+		annot = page_pdf.firstAnnot
+		while (annot.next):
+			annot = annot.next
+		return annot
+
+	def create_page_links(self, page_pdf, page_json):
+		for pe in page_json['pickerElements']:
+			media_content = pe['mediaContent']
+			rect = fitz.Rect( self.translate_rect( pe['coordinates'], page_pdf.rect))
+			border = {'style': 'U', 'width': 0.0}
+			if pe['linkTypeId'] == 1: # xref
+				self.append_pdf_link( page_pdf, media_content, rect, border)
+			elif pe['linkTypeId'] == 2: # ? To investigate
+				pass
+			elif pe['linkTypeId'] == 32: # mailto
+				media_content = 'mailto:' + media_content
+				self.append_pdf_link( page_pdf, media_content, rect, border)
+			elif pe['linkTypeId'] == 256: # sound
+				self.append_media_annot( page_pdf, media_content, rect)
+			elif pe['linkTypeId'] == 2048: # media
+				media_content = re.sub(
+					r'https://www.youtube.com/embed/(.+)', 
+					r'https://www.youtube.com/watch/?v=\1', 
+					pe['pickerElements'][0]['mediaContent'])
+				self.append_pdf_link( page_pdf, media_content, rect, border)
+
 	def create_toc(self, pdf):
 		toc = []
 		for entry in self.magazine.json['issueContent']:
 			pageNumber = entry['pageNumber'] + 1
 			header = entry['header']
 			toc.append([1, header, pageNumber])
-
-
 		pdf.setToC( toc)
 
 	def create_pdf(self):
@@ -181,11 +231,48 @@ class PDF:
 
 		pdf.save( name)
 
+	def clear_page_links( self, page_pdf):
+		links = page_pdf.getLinks()
+		for link in links:
+			page_pdf.deleteLink( link)
+		annot = page_pdf.firstAnnot
+		while annot:
+			annot = page_pdf.deleteAnnot( annot)
+
+	def clear_links(self):
+		name = self.magazine.name + '.pdf'
+		pdf = fitz.open( name)
+
+		for pagenum in range( pdf.pageCount):
+			page_pdf = pdf.loadPage( pagenum)
+			self.clear_page_links( page_pdf)
+	    
+		pdf.saveIncr()
+
+	def update_links(self):
+		name = self.magazine.name + '.pdf'
+		pdf = fitz.open( name)
+
+		for pagenum in range( pdf.pageCount):
+			if pagenum%10 == 0:
+				print()
+			sys.stdout.write('.')
+			sys.stdout.flush()
+
+			page_pdf = pdf.loadPage( pagenum)
+			page_json = self.magazine.json['pages'][pagenum]['page'][0]
+			self.clear_page_links( page_pdf)
+			self.create_page_links( page_pdf, page_json)
+	    
+		pdf.saveIncr()
+
 
 if __name__ == "__main__":
 	parser = argparse.ArgumentParser(description='Load "The Pianist" issues as PDFs.')
 	parser.add_argument( '-n', '--name', help = 'Issue name for loading. If not present, will try to load all new issues.')
 	parser.add_argument( '--load-json', action='store_true', help='If specified, the issue JSON will be loaded instead of PDF.')
+	parser.add_argument( '--update-links', action='store_true', help='Update links and attachments in existing PDFs.')
+	parser.add_argument( '--clear-links', action='store_true', help='Clear links and attachments from existing PDFs.')
 	args = parser.parse_args()
 
 	ext = '.json' if args.load_json else '.pdf'
@@ -203,19 +290,29 @@ if __name__ == "__main__":
 		count += 1
 
 		filename = name + ext
-		if os.path.isfile( filename):
-			print( '{:s} already exists'.format( filename))
-		else:
-			print( 'Loading issue {:s}, {:s}'.format( issue, name))
-			m = Magazine( issue, name)
-			m.get_json()
-			if args.load_json:
+		file_exists = os.path.isfile( filename)
+
+		m = Magazine( issue, name)
+		m.get_json()
+
+		if args.load_json:
+			if not file_exists:
+				print( 'Loading JSON for issue {:s}, {:s}'.format( issue, name))
 				with open(filename, 'w') as f:
 					json.dump( m.json, f)
 			else:
-				PDF(m).create_pdf()
-			print( '{:s} saved'.format( filename))
-
+				print( '{:s} already exists'.format( filename))
+		elif not file_exists:
+			print( 'Loading issue {:s}, {:s}'.format( issue, name))
+			PDF(m).create_pdf()
+		elif args.update_links:
+			print( '{:s}: updating links'.format( filename))
+			PDF(m).update_links()
+		elif args.clear_links:
+			print( '{:s}: clearing links'.format( filename))
+			PDF(m).clear_links()
+		else:
+			print( '{:s} already exists'.format( filename))
 
 	if args.name and count == 0:
 		print( 'Issue named "{:s}" not found on server'.format(args.name))
